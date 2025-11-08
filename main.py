@@ -18,15 +18,30 @@ def init_db():
             due TEXT,
             priority TEXT DEFAULT 'Medium',
             done INTEGER DEFAULT 0,
-            deleted INTEGER DEFAULT 0
+            deleted INTEGER DEFAULT 0,
+            completed_date TEXT
         )"""
     )
-    # Add priority column to existing tables
+    # Add columns to existing tables
     try:
         cur.execute("ALTER TABLE todos ADD COLUMN priority TEXT DEFAULT 'Medium'")
-        con.commit()
     except sqlite3.OperationalError:
-        pass  # Column already exists
+        pass
+    try:
+        cur.execute("ALTER TABLE todos ADD COLUMN completed_date TEXT")
+    except sqlite3.OperationalError:
+        pass
+    
+    # Settings table for daily goal
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )"""
+    )
+    # Set default daily goal if not exists
+    cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('daily_goal', '5')")
+    
     con.commit()
     return con
 
@@ -63,7 +78,8 @@ def add_todo(con, title, category, due, priority):
 
 def mark_done(con, tid):
     cur = con.cursor()
-    cur.execute("UPDATE todos SET done=1 WHERE id=?", (tid,))
+    today = date.today().isoformat()
+    cur.execute("UPDATE todos SET done=1, completed_date=? WHERE id=?", (today, tid))
     con.commit()
 
 
@@ -85,6 +101,28 @@ def get_stats(con, where_clause="", params=()):
     return total, done
 
 
+def get_daily_goal(con):
+    cur = con.cursor()
+    result = cur.execute("SELECT value FROM settings WHERE key='daily_goal'").fetchone()
+    return int(result[0]) if result else 5
+
+
+def set_daily_goal(con, goal):
+    cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('daily_goal', ?)", (str(goal),))
+    con.commit()
+
+
+def get_today_completed(con):
+    cur = con.cursor()
+    today = date.today().isoformat()
+    count = cur.execute(
+        "SELECT COUNT(*) FROM todos WHERE deleted=0 AND done=1 AND completed_date=?",
+        (today,)
+    ).fetchone()[0]
+    return count
+
+
 # ---------- UI Helpers ----------
 def draw_progress_bar(win, y, x, percent, width):
     filled = int((percent / 100) * width)
@@ -101,7 +139,7 @@ def get_priority_order(priority):
 def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle=""):
     stdscr.clear()
     stdscr.addstr(0, 0, "📋 Daily Planner (Dashboard)")
-    stdscr.addstr(1, 0, "a=add  d=done  x=delete  c=completed  /=search  f=filter  q=quit")
+    stdscr.addstr(1, 0, "a=add  d=done  x=delete  c=completed  g=grind  /=search  f=filter  q=quit")
     stdscr.addstr(2, 0, "-" * 50)
 
     if subtitle:
@@ -188,6 +226,67 @@ def draw_completed(stdscr, con):
     stdscr.refresh()
 
 
+def draw_daily_grind(stdscr, con):
+    stdscr.clear()
+    stdscr.addstr(0, 0, "💪 DAILY GRIND TRACKER", curses.A_BOLD)
+    stdscr.addstr(1, 0, "Press 's' to set goal | 'b' to go back")
+    stdscr.addstr(2, 0, "=" * 50)
+
+    today = date.today()
+    stdscr.addstr(4, 0, f"📅 Date: {today.strftime('%A, %B %d, %Y')}", curses.color_pair(4))
+
+    # Get daily stats
+    daily_goal = get_daily_goal(con)
+    completed_today = get_today_completed(con)
+    
+    stdscr.addstr(6, 0, f"🎯 Daily Goal: {daily_goal} tasks")
+    stdscr.addstr(7, 0, f"✅ Completed Today: {completed_today} tasks")
+    
+    # Progress calculation
+    progress = int((completed_today / daily_goal) * 100) if daily_goal > 0 else 0
+    progress = min(progress, 100)  # Cap at 100%
+    
+    stdscr.addstr(9, 0, "Progress:")
+    draw_progress_bar(stdscr, 10, 0, progress, 40)
+    
+    # Motivational message
+    stdscr.addstr(12, 0, "-" * 50)
+    if progress >= 100:
+        stdscr.addstr(13, 0, "🔥 BEAST MODE! You crushed today's goal! 🔥", curses.color_pair(3) | curses.A_BOLD)
+    elif progress >= 75:
+        stdscr.addstr(13, 0, "💪 Almost there! Keep pushing!", curses.color_pair(3))
+    elif progress >= 50:
+        stdscr.addstr(13, 0, "👍 Halfway there! You got this!", curses.color_pair(2))
+    elif progress >= 25:
+        stdscr.addstr(13, 0, "⚡ Good start! Keep the momentum!", curses.color_pair(2))
+    else:
+        stdscr.addstr(13, 0, "🚀 Let's get started! Grind time!", curses.color_pair(1))
+    
+    # Show today's completed tasks
+    stdscr.addstr(15, 0, "Today's Completed Tasks:", curses.A_BOLD)
+    stdscr.addstr(16, 0, "-" * 50)
+    
+    cur = con.cursor()
+    today_iso = today.isoformat()
+    cur.execute(
+        "SELECT title, priority, category FROM todos WHERE deleted=0 AND done=1 AND completed_date=? ORDER BY id DESC",
+        (today_iso,)
+    )
+    completed_tasks = cur.fetchall()
+    
+    if not completed_tasks:
+        stdscr.addstr(17, 0, "No tasks completed yet today.", curses.A_DIM)
+    else:
+        for idx, task in enumerate(completed_tasks[:8]):  # Show max 8 tasks
+            title, priority, category = task
+            priority_symbol = "🔴" if priority == "High" else ("🟡" if priority == "Medium" else "🟢")
+            stdscr.addstr(17 + idx, 0, f"  ✓ {priority_symbol} {title}")
+            if category:
+                stdscr.addstr(f" #{category}", curses.color_pair(4))
+    
+    stdscr.refresh()
+
+
 # ---------- Main Loop ----------
 def main(stdscr):
     con = init_db()
@@ -212,6 +311,8 @@ def main(stdscr):
             todos = draw_dashboard(stdscr, con, cursor_idx, where_clause, params, subtitle)
         elif view == "completed":
             draw_completed(stdscr, con)
+        elif view == "grind":
+            draw_daily_grind(stdscr, con)
 
         ch = stdscr.getch()
 
@@ -247,6 +348,8 @@ def main(stdscr):
                 cursor_idx = 0
             elif ch == ord("c"):
                 view = "completed"
+            elif ch == ord("g"):
+                view = "grind"
             elif ch == ord("f"):  # filter by category
                 curses.echo()
                 stdscr.addstr(21, 0, "Filter by category (#tag): ")
@@ -272,6 +375,19 @@ def main(stdscr):
             if ch == ord("b"):
                 view = "dashboard"
                 cursor_idx = 0
+        elif view == "grind":
+            if ch == ord("b"):
+                view = "dashboard"
+            elif ch == ord("s"):  # set daily goal
+                curses.echo()
+                stdscr.addstr(25, 0, "Set daily goal (number of tasks): ")
+                try:
+                    goal = int(stdscr.getstr().decode("utf-8"))
+                    if goal > 0:
+                        set_daily_goal(con, goal)
+                except:
+                    pass
+                curses.noecho()
 
 
 if __name__ == "__main__":
