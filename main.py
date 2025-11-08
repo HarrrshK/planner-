@@ -123,10 +123,38 @@ def get_today_completed(con):
     return count
 
 
+def get_weekly_stats(con):
+    """Get completion stats for the last 7 days"""
+    cur = con.cursor()
+    today = date.today()
+    stats = []
+    
+    for i in range(6, -1, -1):  # Last 7 days (6 days ago to today)
+        day = today - timedelta(days=i)
+        day_iso = day.isoformat()
+        count = cur.execute(
+            "SELECT COUNT(*) FROM todos WHERE deleted=0 AND done=1 AND completed_date=?",
+            (day_iso,)
+        ).fetchone()[0]
+        stats.append((day, count))
+    
+    return stats
+
+
 # ---------- UI Helpers ----------
 def draw_progress_bar(win, y, x, percent, width):
     filled = int((percent / 100) * width)
     bar = "[" + "#" * filled + "-" * (width - filled) + f"] {percent}%"
+    win.addstr(y, x, bar)
+
+
+def draw_bar_chart(win, y, x, value, max_value, width=20):
+    """Draw a horizontal bar chart"""
+    if max_value == 0:
+        filled = 0
+    else:
+        filled = int((value / max_value) * width)
+    bar = "█" * filled + "░" * (width - filled)
     win.addstr(y, x, bar)
 
 
@@ -139,8 +167,8 @@ def get_priority_order(priority):
 def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle=""):
     stdscr.clear()
     stdscr.addstr(0, 0, "📋 Daily Planner (Dashboard)")
-    stdscr.addstr(1, 0, "a=add  d=done  x=delete  c=completed  g=grind  /=search  f=filter  q=quit")
-    stdscr.addstr(2, 0, "-" * 50)
+    stdscr.addstr(1, 0, "a=add  d=done  x=delete  c=completed  g=grind  w=weekly  /=search  f=filter  q=quit")
+    stdscr.addstr(2, 0, "-" * 70)
 
     if subtitle:
         stdscr.addstr(3, 0, subtitle, curses.A_BOLD)
@@ -287,6 +315,87 @@ def draw_daily_grind(stdscr, con):
     stdscr.refresh()
 
 
+def draw_weekly_stats(stdscr, con):
+    stdscr.clear()
+    stdscr.addstr(0, 0, "📊 WEEKLY STATS", curses.A_BOLD)
+    stdscr.addstr(1, 0, "Press 'b' to go back")
+    stdscr.addstr(2, 0, "=" * 70)
+
+    # Get weekly data
+    weekly_data = get_weekly_stats(con)
+    daily_goal = get_daily_goal(con)
+    
+    # Calculate totals
+    total_completed = sum(count for _, count in weekly_data)
+    total_goal = daily_goal * 7
+    weekly_avg = total_completed / 7
+    
+    # Summary stats
+    stdscr.addstr(4, 0, f"📅 Last 7 Days Summary:", curses.color_pair(4) | curses.A_BOLD)
+    stdscr.addstr(5, 0, f"  Total Completed: {total_completed} tasks")
+    stdscr.addstr(6, 0, f"  Daily Average: {weekly_avg:.1f} tasks")
+    stdscr.addstr(7, 0, f"  Weekly Goal: {total_goal} tasks ({daily_goal}/day)")
+    
+    weekly_progress = int((total_completed / total_goal) * 100) if total_goal > 0 else 0
+    stdscr.addstr(8, 0, f"  Weekly Progress: {weekly_progress}%")
+    
+    stdscr.addstr(10, 0, "-" * 70)
+    
+    # Daily breakdown with bar chart
+    stdscr.addstr(11, 0, "Daily Breakdown:", curses.A_BOLD)
+    stdscr.addstr(12, 0, "-" * 70)
+    
+    max_count = max((count for _, count in weekly_data), default=1)
+    max_count = max(max_count, daily_goal)  # At least show up to daily goal
+    
+    for idx, (day, count) in enumerate(weekly_data):
+        day_name = day.strftime("%a %m/%d")
+        
+        # Color based on goal achievement
+        if count >= daily_goal:
+            color = curses.color_pair(3)  # Green
+            status = "✓"
+        elif count >= daily_goal * 0.5:
+            color = curses.color_pair(2)  # Yellow
+            status = "~"
+        else:
+            color = curses.color_pair(1)  # Red
+            status = "✗"
+        
+        # Draw day and count
+        y_pos = 14 + idx
+        stdscr.addstr(y_pos, 0, f"{status} {day_name}: ", color)
+        stdscr.addstr(f"{count:2d} tasks ", color)
+        
+        # Draw bar chart
+        draw_bar_chart(stdscr, y_pos, 25, count, max_count, 30)
+        
+        # Show percentage of goal
+        day_percent = int((count / daily_goal) * 100) if daily_goal > 0 else 0
+        stdscr.addstr(f" ({day_percent}%)", color)
+    
+    # Streak calculation
+    stdscr.addstr(22, 0, "-" * 70)
+    current_streak = 0
+    for day, count in reversed(weekly_data):
+        if count >= daily_goal:
+            current_streak += 1
+        else:
+            break
+    
+    if current_streak > 0:
+        stdscr.addstr(23, 0, f"🔥 Current Streak: {current_streak} day(s) hitting goal!", curses.color_pair(3) | curses.A_BOLD)
+    else:
+        stdscr.addstr(23, 0, f"💡 Start a streak! Complete {daily_goal} tasks today!", curses.color_pair(2))
+    
+    # Best day
+    best_day, best_count = max(weekly_data, key=lambda x: x[1])
+    if best_count > 0:
+        stdscr.addstr(24, 0, f"⭐ Best Day: {best_day.strftime('%A')} with {best_count} tasks", curses.color_pair(4))
+    
+    stdscr.refresh()
+
+
 # ---------- Main Loop ----------
 def main(stdscr):
     con = init_db()
@@ -313,6 +422,8 @@ def main(stdscr):
             draw_completed(stdscr, con)
         elif view == "grind":
             draw_daily_grind(stdscr, con)
+        elif view == "weekly":
+            draw_weekly_stats(stdscr, con)
 
         ch = stdscr.getch()
 
@@ -350,6 +461,8 @@ def main(stdscr):
                 view = "completed"
             elif ch == ord("g"):
                 view = "grind"
+            elif ch == ord("w"):
+                view = "weekly"
             elif ch == ord("f"):  # filter by category
                 curses.echo()
                 stdscr.addstr(21, 0, "Filter by category (#tag): ")
@@ -388,6 +501,9 @@ def main(stdscr):
                 except:
                     pass
                 curses.noecho()
+        elif view == "weekly":
+            if ch == ord("b"):
+                view = "dashboard"
 
 
 if __name__ == "__main__":
