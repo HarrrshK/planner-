@@ -16,10 +16,17 @@ def init_db():
             title TEXT,
             category TEXT,
             due TEXT,
+            priority TEXT DEFAULT 'Medium',
             done INTEGER DEFAULT 0,
             deleted INTEGER DEFAULT 0
         )"""
     )
+    # Add priority column to existing tables
+    try:
+        cur.execute("ALTER TABLE todos ADD COLUMN priority TEXT DEFAULT 'Medium'")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     con.commit()
     return con
 
@@ -45,11 +52,11 @@ def parse_due_date(s: str) -> str:
 
 
 # ---------- DB Operations ----------
-def add_todo(con, title, category, due):
+def add_todo(con, title, category, due, priority):
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO todos(title, category, due, done, deleted) VALUES (?,?,?,?,0)",
-        (title, category, parse_due_date(due), 0),
+        "INSERT INTO todos(title, category, due, priority, done, deleted) VALUES (?,?,?,?,0,0)",
+        (title, category, parse_due_date(due), priority),
     )
     con.commit()
 
@@ -85,6 +92,12 @@ def draw_progress_bar(win, y, x, percent, width):
     win.addstr(y, x, bar)
 
 
+def get_priority_order(priority):
+    """Return sort order for priority (lower is higher priority)"""
+    order = {"High": 0, "Medium": 1, "Low": 2}
+    return order.get(priority, 1)
+
+
 def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle=""):
     stdscr.clear()
     stdscr.addstr(0, 0, "📋 Daily Planner (Dashboard)")
@@ -96,16 +109,19 @@ def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle
 
     cur = con.cursor()
     cur.execute(
-        f"SELECT id, title, category, due, done FROM todos WHERE deleted=0 AND done=0 {where_clause} ORDER BY id DESC",
+        f"SELECT id, title, category, due, done, priority FROM todos WHERE deleted=0 AND done=0 {where_clause}",
         params,
     )
     todos = cur.fetchall()
+    
+    # Sort by priority (High > Medium > Low) then by id descending
+    todos = sorted(todos, key=lambda t: (get_priority_order(t[5]), -t[0]))
 
     if not todos:
         stdscr.addstr(5, 0, "No todos yet!", curses.A_DIM)
     else:
         for idx, t in enumerate(todos):
-            tid, title, cat, due_str, done = t
+            tid, title, cat, due_str, done, priority = t
             prefix = "[x] " if done else "[ ] "
 
             attr = 0
@@ -121,9 +137,17 @@ def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle
                 except:
                     pass
 
+            # Priority indicator with color
+            priority_color = curses.color_pair(5) if priority == "High" else (
+                curses.color_pair(2) if priority == "Medium" else curses.color_pair(6)
+            )
+            priority_symbol = "🔴" if priority == "High" else ("🟡" if priority == "Medium" else "🟢")
+
             marker = "-> " if idx == cursor_idx else "   "
             stdscr.addstr(5 + idx, 0, marker)
-            stdscr.addstr(f"{prefix}{title} ", attr)
+            stdscr.addstr(f"{prefix}", attr)
+            stdscr.addstr(f"{priority_symbol} ", priority_color)
+            stdscr.addstr(f"{title} ", attr)
             if cat:
                 stdscr.addstr(f"#{cat}", curses.color_pair(4))
             if due_str:
@@ -145,7 +169,7 @@ def draw_completed(stdscr, con):
 
     cur = con.cursor()
     cur.execute(
-        "SELECT id, title, category, due FROM todos WHERE deleted=0 AND done=1 ORDER BY id DESC"
+        "SELECT id, title, category, due, priority FROM todos WHERE deleted=0 AND done=1 ORDER BY id DESC"
     )
     todos = cur.fetchall()
 
@@ -153,8 +177,9 @@ def draw_completed(stdscr, con):
         stdscr.addstr(3, 0, "No completed todos yet!", curses.A_DIM)
     else:
         for idx, t in enumerate(todos):
-            tid, title, cat, due_str = t
-            stdscr.addstr(3 + idx, 0, f"[x] {title} ")
+            tid, title, cat, due_str, priority = t
+            priority_symbol = "🔴" if priority == "High" else ("🟡" if priority == "Medium" else "🟢")
+            stdscr.addstr(3 + idx, 0, f"[x] {priority_symbol} {title} ")
             if cat:
                 stdscr.addstr(f"#{cat}", curses.color_pair(4))
             if due_str:
@@ -167,10 +192,12 @@ def draw_completed(stdscr, con):
 def main(stdscr):
     con = init_db()
     curses.curs_set(0)
-    curses.init_pair(1, curses.COLOR_RED, curses.COLOR_BLACK)  # overdue
-    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # today
-    curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)  # future
-    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)  # category
+    curses.init_pair(1, curses.COLOR_RED, curses.COLOR_BLACK)      # overdue
+    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)   # today / medium
+    curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)    # future
+    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)     # category
+    curses.init_pair(5, curses.COLOR_RED, curses.COLOR_BLACK)      # high priority
+    curses.init_pair(6, curses.COLOR_GREEN, curses.COLOR_BLACK)    # low priority
 
     view = "dashboard"
     cursor_idx = 0
@@ -204,8 +231,12 @@ def main(stdscr):
                 category = stdscr.getstr().decode("utf-8")
                 stdscr.addstr(2, 0, "Due (YYYY-MM-DD, today, tomorrow, +3d): ")
                 due = stdscr.getstr().decode("utf-8")
+                stdscr.addstr(3, 0, "Priority (High/Medium/Low) [Medium]: ")
+                priority = stdscr.getstr().decode("utf-8").strip().capitalize()
+                if priority not in ["High", "Medium", "Low"]:
+                    priority = "Medium"
                 curses.noecho()
-                add_todo(con, title, category, due)
+                add_todo(con, title, category, due, priority)
                 cursor_idx = 0
                 where_clause, params, subtitle = "", (), ""
             elif ch == ord("d") and todos:
