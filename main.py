@@ -3,6 +3,8 @@ import sqlite3
 from datetime import date, datetime, timedelta
 from dateutil import parser as date_parser
 from collections import defaultdict
+import time
+import threading
 
 DB_FILE = "todos.db"
 
@@ -20,7 +22,8 @@ def init_db():
             priority TEXT DEFAULT 'Medium',
             done INTEGER DEFAULT 0,
             deleted INTEGER DEFAULT 0,
-            completed_date TEXT
+            completed_date TEXT,
+            pomodoros INTEGER DEFAULT 0
         )"""
     )
     # Add columns to existing tables
@@ -32,6 +35,21 @@ def init_db():
         cur.execute("ALTER TABLE todos ADD COLUMN completed_date TEXT")
     except sqlite3.OperationalError:
         pass
+    try:
+        cur.execute("ALTER TABLE todos ADD COLUMN pomodoros INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    
+    # Pomodoro sessions table
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS pomodoro_sessions (
+            id INTEGER PRIMARY KEY,
+            todo_id INTEGER,
+            date TEXT,
+            duration INTEGER,
+            completed INTEGER DEFAULT 1
+        )"""
+    )
     
     # Settings table for daily goal
     cur.execute(
@@ -40,8 +58,10 @@ def init_db():
             value TEXT
         )"""
     )
-    # Set default daily goal if not exists
+    # Set defaults
     cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('daily_goal', '5')")
+    cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('pomodoro_work', '25')")
+    cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('pomodoro_break', '5')")
     
     con.commit()
     return con
@@ -71,7 +91,7 @@ def parse_due_date(s: str) -> str:
 def add_todo(con, title, category, due, priority):
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO todos(title, category, due, priority, done, deleted) VALUES (?,?,?,?,0,0)",
+        "INSERT INTO todos(title, category, due, priority, done, deleted, pomodoros) VALUES (?,?,?,?,0,0,0)",
         (title, category, parse_due_date(due), priority),
     )
     con.commit()
@@ -88,6 +108,45 @@ def delete_todo(con, tid):
     cur = con.cursor()
     cur.execute("UPDATE todos SET deleted=1 WHERE id=?", (tid,))
     con.commit()
+
+
+def add_pomodoro_session(con, todo_id, duration):
+    cur = con.cursor()
+    today = date.today().isoformat()
+    cur.execute(
+        "INSERT INTO pomodoro_sessions(todo_id, date, duration, completed) VALUES (?,?,?,1)",
+        (todo_id, today, duration)
+    )
+    cur.execute("UPDATE todos SET pomodoros = pomodoros + 1 WHERE id=?", (todo_id,))
+    con.commit()
+
+
+def get_pomodoro_settings(con):
+    cur = con.cursor()
+    work = int(cur.execute("SELECT value FROM settings WHERE key='pomodoro_work'").fetchone()[0])
+    break_time = int(cur.execute("SELECT value FROM settings WHERE key='pomodoro_break'").fetchone()[0])
+    return work, break_time
+
+
+def set_pomodoro_settings(con, work, break_time):
+    cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('pomodoro_work', ?)", (str(work),))
+    cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('pomodoro_break', ?)", (str(break_time),))
+    con.commit()
+
+
+def get_today_pomodoros(con):
+    cur = con.cursor()
+    today = date.today().isoformat()
+    count = cur.execute(
+        "SELECT COUNT(*) FROM pomodoro_sessions WHERE date=?",
+        (today,)
+    ).fetchone()[0]
+    total_minutes = cur.execute(
+        "SELECT SUM(duration) FROM pomodoro_sessions WHERE date=?",
+        (today,)
+    ).fetchone()[0] or 0
+    return count, total_minutes
 
 
 def get_stats(con, where_clause="", params=()):
@@ -223,6 +282,37 @@ def get_quarterly_stats(con):
     }
 
 
+# ---------- Pomodoro Timer State ----------
+class PomodoroTimer:
+    def __init__(self):
+        self.running = False
+        self.time_left = 0
+        self.total_time = 0
+        self.is_break = False
+        self.task_id = None
+        self.task_title = ""
+        
+    def start(self, duration, task_id, task_title, is_break=False):
+        self.running = True
+        self.time_left = duration * 60
+        self.total_time = duration * 60
+        self.is_break = is_break
+        self.task_id = task_id
+        self.task_title = task_title
+    
+    def stop(self):
+        self.running = False
+        
+    def tick(self):
+        if self.running and self.time_left > 0:
+            self.time_left -= 1
+            return True
+        elif self.running and self.time_left <= 0:
+            self.running = False
+            return False
+        return self.running
+
+
 # ---------- UI Helpers ----------
 def draw_progress_bar(win, y, x, percent, width):
     filled = int((percent / 100) * width)
@@ -249,7 +339,7 @@ def get_priority_order(priority):
 def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle=""):
     stdscr.clear()
     stdscr.addstr(0, 0, "📋 Daily Planner (Dashboard)")
-    stdscr.addstr(1, 0, "a=add  d=done  x=delete  c=completed  g=grind  w=weekly  m=monthly  q=quit")
+    stdscr.addstr(1, 0, "a=add  d=done  x=delete  p=pomodoro  c=completed  g=grind  w=weekly  m=monthly  q=quit")
     stdscr.addstr(2, 0, "-" * 70)
 
     if subtitle:
@@ -257,7 +347,7 @@ def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle
 
     cur = con.cursor()
     cur.execute(
-        f"SELECT id, title, category, due, done, priority FROM todos WHERE deleted=0 AND done=0 {where_clause}",
+        f"SELECT id, title, category, due, done, priority, pomodoros FROM todos WHERE deleted=0 AND done=0 {where_clause}",
         params,
     )
     todos = cur.fetchall()
@@ -269,7 +359,7 @@ def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle
         stdscr.addstr(5, 0, "No todos yet!", curses.A_DIM)
     else:
         for idx, t in enumerate(todos):
-            tid, title, cat, due_str, done, priority = t
+            tid, title, cat, due_str, done, priority, pomodoros = t
             prefix = "[x] " if done else "[ ] "
 
             attr = 0
@@ -296,6 +386,8 @@ def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle
             stdscr.addstr(f"{prefix}", attr)
             stdscr.addstr(f"{priority_symbol} ", priority_color)
             stdscr.addstr(f"{title} ", attr)
+            if pomodoros > 0:
+                stdscr.addstr(f"🍅x{pomodoros} ", curses.color_pair(1))
             if cat:
                 stdscr.addstr(f"#{cat}", curses.color_pair(4))
             if due_str:
@@ -303,11 +395,111 @@ def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle
 
     total, done = get_stats(con, where_clause, params)
     progress = int((done / total) * 100) if total else 0
-    stdscr.addstr(18, 0, f"Total: {total}  Done: {done}  Progress: {progress}%")
-    draw_progress_bar(stdscr, 19, 0, progress, stdscr.getmaxyx()[1] - 7)
+    
+    # Show pomodoro stats for today
+    pomo_count, pomo_minutes = get_today_pomodoros(con)
+    stdscr.addstr(17, 0, f"Tasks: {done}/{total} ({progress}%)  |  Pomodoros Today: 🍅x{pomo_count} ({pomo_minutes}min)")
+    draw_progress_bar(stdscr, 18, 0, progress, stdscr.getmaxyx()[1] - 7)
 
     stdscr.refresh()
     return todos
+
+
+def draw_pomodoro(stdscr, con, timer, task_id, task_title):
+    """Draw pomodoro timer screen"""
+    work_min, break_min = get_pomodoro_settings(con)
+    
+    while True:
+        stdscr.clear()
+        stdscr.addstr(0, 0, "🍅 POMODORO TIMER", curses.A_BOLD)
+        stdscr.addstr(1, 0, "Press 's' to start | 'p' to pause | 'r' to reset | 'c' for settings | 'b' to go back")
+        stdscr.addstr(2, 0, "=" * 70)
+        
+        stdscr.addstr(4, 0, f"Task: {task_title}", curses.color_pair(4) | curses.A_BOLD)
+        stdscr.addstr(6, 0, f"Work Duration: {work_min} min  |  Break Duration: {break_min} min")
+        
+        if timer.running:
+            minutes = timer.time_left // 60
+            seconds = timer.time_left % 60
+            
+            status = "BREAK TIME! 😌" if timer.is_break else "FOCUS TIME! 💪"
+            color = curses.color_pair(3) if timer.is_break else curses.color_pair(1)
+            
+            stdscr.addstr(8, 0, status, color | curses.A_BOLD)
+            
+            # Big timer display
+            time_str = f"{minutes:02d}:{seconds:02d}"
+            stdscr.addstr(10, 15, time_str, curses.A_BOLD)
+            stdscr.attron(curses.A_BOLD)
+            for i, char in enumerate(time_str):
+                stdscr.addstr(11, 15 + i * 2, char * 2)
+            stdscr.attroff(curses.A_BOLD)
+            
+            # Progress bar
+            progress = int(((timer.total_time - timer.time_left) / timer.total_time) * 100)
+            stdscr.addstr(14, 0, "Progress:")
+            draw_progress_bar(stdscr, 15, 0, progress, 50)
+            
+        else:
+            stdscr.addstr(8, 0, "Timer stopped. Press 's' to start!", curses.A_DIM)
+            stdscr.addstr(10, 15, f"{work_min:02d}:00", curses.A_BOLD)
+        
+        # Today's pomodoro stats
+        pomo_count, pomo_minutes = get_today_pomodoros(con)
+        stdscr.addstr(18, 0, "-" * 70)
+        stdscr.addstr(19, 0, f"Today's Sessions: 🍅x{pomo_count}  |  Total Focus Time: {pomo_minutes} minutes")
+        
+        stdscr.refresh()
+        
+        # Handle timer tick
+        if timer.running:
+            stdscr.timeout(1000)  # 1 second timeout
+            ch = stdscr.getch()
+            
+            if not timer.tick():
+                # Timer finished!
+                if not timer.is_break:
+                    # Work session finished - save it
+                    add_pomodoro_session(con, task_id, work_min)
+                    timer.start(break_min, task_id, task_title, is_break=True)
+                    curses.beep()
+                else:
+                    # Break finished
+                    timer.stop()
+                    curses.beep()
+        else:
+            stdscr.timeout(-1)  # Blocking wait
+            ch = stdscr.getch()
+        
+        if ch == ord('b'):
+            timer.stop()
+            return
+        elif ch == ord('s'):
+            if not timer.running:
+                timer.start(work_min, task_id, task_title, is_break=False)
+        elif ch == ord('p'):
+            if timer.running:
+                timer.running = False
+            else:
+                timer.running = True
+        elif ch == ord('r'):
+            timer.stop()
+            timer.time_left = work_min * 60
+            timer.total_time = work_min * 60
+        elif ch == ord('c'):
+            # Settings
+            curses.echo()
+            stdscr.addstr(22, 0, "Work duration (minutes): ")
+            try:
+                new_work = int(stdscr.getstr().decode("utf-8"))
+                stdscr.addstr(23, 0, "Break duration (minutes): ")
+                new_break = int(stdscr.getstr().decode("utf-8"))
+                if new_work > 0 and new_break > 0:
+                    set_pomodoro_settings(con, new_work, new_break)
+                    work_min, break_min = new_work, new_break
+            except:
+                pass
+            curses.noecho()
 
 
 def draw_completed(stdscr, con):
@@ -317,7 +509,7 @@ def draw_completed(stdscr, con):
 
     cur = con.cursor()
     cur.execute(
-        "SELECT id, title, category, due, priority FROM todos WHERE deleted=0 AND done=1 ORDER BY id DESC"
+        "SELECT id, title, category, due, priority, pomodoros FROM todos WHERE deleted=0 AND done=1 ORDER BY id DESC"
     )
     todos = cur.fetchall()
 
@@ -325,9 +517,11 @@ def draw_completed(stdscr, con):
         stdscr.addstr(3, 0, "No completed todos yet!", curses.A_DIM)
     else:
         for idx, t in enumerate(todos):
-            tid, title, cat, due_str, priority = t
+            tid, title, cat, due_str, priority, pomodoros = t
             priority_symbol = "🔴" if priority == "High" else ("🟡" if priority == "Medium" else "🟢")
             stdscr.addstr(3 + idx, 0, f"[x] {priority_symbol} {title} ")
+            if pomodoros > 0:
+                stdscr.addstr(f"🍅x{pomodoros} ", curses.color_pair(1))
             if cat:
                 stdscr.addstr(f"#{cat}", curses.color_pair(4))
             if due_str:
@@ -348,49 +542,53 @@ def draw_daily_grind(stdscr, con):
     # Get daily stats
     daily_goal = get_daily_goal(con)
     completed_today = get_today_completed(con)
+    pomo_count, pomo_minutes = get_today_pomodoros(con)
     
     stdscr.addstr(6, 0, f"🎯 Daily Goal: {daily_goal} tasks")
     stdscr.addstr(7, 0, f"✅ Completed Today: {completed_today} tasks")
+    stdscr.addstr(8, 0, f"🍅 Pomodoros: {pomo_count} sessions ({pomo_minutes} min)")
     
     # Progress calculation
     progress = int((completed_today / daily_goal) * 100) if daily_goal > 0 else 0
     progress = min(progress, 100)  # Cap at 100%
     
-    stdscr.addstr(9, 0, "Progress:")
-    draw_progress_bar(stdscr, 10, 0, progress, 40)
+    stdscr.addstr(10, 0, "Progress:")
+    draw_progress_bar(stdscr, 11, 0, progress, 40)
     
     # Motivational message
-    stdscr.addstr(12, 0, "-" * 50)
+    stdscr.addstr(13, 0, "-" * 50)
     if progress >= 100:
-        stdscr.addstr(13, 0, "🔥 BEAST MODE! You crushed today's goal! 🔥", curses.color_pair(3) | curses.A_BOLD)
+        stdscr.addstr(14, 0, "🔥 BEAST MODE! You crushed today's goal! 🔥", curses.color_pair(3) | curses.A_BOLD)
     elif progress >= 75:
-        stdscr.addstr(13, 0, "💪 Almost there! Keep pushing!", curses.color_pair(3))
+        stdscr.addstr(14, 0, "💪 Almost there! Keep pushing!", curses.color_pair(3))
     elif progress >= 50:
-        stdscr.addstr(13, 0, "👍 Halfway there! You got this!", curses.color_pair(2))
+        stdscr.addstr(14, 0, "👍 Halfway there! You got this!", curses.color_pair(2))
     elif progress >= 25:
-        stdscr.addstr(13, 0, "⚡ Good start! Keep the momentum!", curses.color_pair(2))
+        stdscr.addstr(14, 0, "⚡ Good start! Keep the momentum!", curses.color_pair(2))
     else:
-        stdscr.addstr(13, 0, "🚀 Let's get started! Grind time!", curses.color_pair(1))
+        stdscr.addstr(14, 0, "🚀 Let's get started! Grind time!", curses.color_pair(1))
     
     # Show today's completed tasks
-    stdscr.addstr(15, 0, "Today's Completed Tasks:", curses.A_BOLD)
-    stdscr.addstr(16, 0, "-" * 50)
+    stdscr.addstr(16, 0, "Today's Completed Tasks:", curses.A_BOLD)
+    stdscr.addstr(17, 0, "-" * 50)
     
     cur = con.cursor()
     today_iso = today.isoformat()
     cur.execute(
-        "SELECT title, priority, category FROM todos WHERE deleted=0 AND done=1 AND completed_date=? ORDER BY id DESC",
+        "SELECT title, priority, category, pomodoros FROM todos WHERE deleted=0 AND done=1 AND completed_date=? ORDER BY id DESC",
         (today_iso,)
     )
     completed_tasks = cur.fetchall()
     
     if not completed_tasks:
-        stdscr.addstr(17, 0, "No tasks completed yet today.", curses.A_DIM)
+        stdscr.addstr(18, 0, "No tasks completed yet today.", curses.A_DIM)
     else:
         for idx, task in enumerate(completed_tasks[:8]):  # Show max 8 tasks
-            title, priority, category = task
+            title, priority, category, pomodoros = task
             priority_symbol = "🔴" if priority == "High" else ("🟡" if priority == "Medium" else "🟢")
-            stdscr.addstr(17 + idx, 0, f"  ✓ {priority_symbol} {title}")
+            stdscr.addstr(18 + idx, 0, f"  ✓ {priority_symbol} {title}")
+            if pomodoros > 0:
+                stdscr.addstr(f" 🍅x{pomodoros}", curses.color_pair(1))
             if category:
                 stdscr.addstr(f" #{category}", curses.color_pair(4))
     
@@ -583,6 +781,7 @@ def main(stdscr):
     where_clause = ""
     params = ()
     subtitle = ""
+    timer = PomodoroTimer()
 
     while True:
         todos = []
@@ -597,6 +796,10 @@ def main(stdscr):
             draw_weekly_stats(stdscr, con)
         elif view == "monthly":
             draw_monthly_overview(stdscr, con)
+        elif view == "pomodoro":
+            if timer.task_id:
+                draw_pomodoro(stdscr, con, timer, timer.task_id, timer.task_title)
+                view = "dashboard"
 
         ch = stdscr.getch()
 
@@ -630,6 +833,12 @@ def main(stdscr):
             elif ch == ord("x") and todos:
                 delete_todo(con, todos[cursor_idx][0])
                 cursor_idx = 0
+            elif ch == ord("p") and todos:
+                # Start pomodoro for selected task
+                task = todos[cursor_idx]
+                timer.task_id = task[0]
+                timer.task_title = task[1]
+                view = "pomodoro"
             elif ch == ord("c"):
                 view = "completed"
             elif ch == ord("g"):
