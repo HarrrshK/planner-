@@ -2,6 +2,7 @@ import curses
 import sqlite3
 from datetime import date, datetime, timedelta
 from dateutil import parser as date_parser
+from collections import defaultdict
 
 DB_FILE = "todos.db"
 
@@ -141,6 +142,87 @@ def get_weekly_stats(con):
     return stats
 
 
+def get_monthly_stats(con):
+    """Get completion stats for current month"""
+    cur = con.cursor()
+    today = date.today()
+    first_day = today.replace(day=1)
+    
+    # Get all completed tasks this month
+    cur.execute(
+        """SELECT completed_date, priority, category 
+           FROM todos 
+           WHERE deleted=0 AND done=1 AND completed_date >= ? AND completed_date <= ?
+           ORDER BY completed_date""",
+        (first_day.isoformat(), today.isoformat())
+    )
+    tasks = cur.fetchall()
+    
+    # Group by date
+    daily_counts = defaultdict(int)
+    priority_counts = defaultdict(int)
+    category_counts = defaultdict(int)
+    
+    for task_date, priority, category in tasks:
+        daily_counts[task_date] += 1
+        if priority:
+            priority_counts[priority] += 1
+        if category:
+            category_counts[category] += 1
+    
+    return {
+        'total': len(tasks),
+        'daily_counts': daily_counts,
+        'priority_counts': dict(priority_counts),
+        'category_counts': dict(category_counts),
+        'days_in_month': (today - first_day).days + 1
+    }
+
+
+def get_quarterly_stats(con):
+    """Get completion stats for current quarter"""
+    cur = con.cursor()
+    today = date.today()
+    
+    # Calculate quarter start
+    quarter = (today.month - 1) // 3
+    quarter_start = date(today.year, quarter * 3 + 1, 1)
+    
+    # Get monthly totals for the quarter
+    monthly_totals = []
+    for month_offset in range(3):
+        month_start = quarter_start.replace(month=quarter_start.month + month_offset)
+        if month_offset < 2:
+            month_end = quarter_start.replace(month=quarter_start.month + month_offset + 1) - timedelta(days=1)
+        else:
+            month_end = today
+        
+        count = cur.execute(
+            """SELECT COUNT(*) FROM todos 
+               WHERE deleted=0 AND done=1 
+               AND completed_date >= ? AND completed_date <= ?""",
+            (month_start.isoformat(), month_end.isoformat())
+        ).fetchone()[0]
+        
+        monthly_totals.append((month_start.strftime("%B"), count))
+    
+    # Total for quarter
+    total = cur.execute(
+        """SELECT COUNT(*) FROM todos 
+           WHERE deleted=0 AND done=1 
+           AND completed_date >= ? AND completed_date <= ?""",
+        (quarter_start.isoformat(), today.isoformat())
+    ).fetchone()[0]
+    
+    return {
+        'quarter': quarter + 1,
+        'quarter_start': quarter_start,
+        'total': total,
+        'monthly_totals': monthly_totals,
+        'days_in_quarter': (today - quarter_start).days + 1
+    }
+
+
 # ---------- UI Helpers ----------
 def draw_progress_bar(win, y, x, percent, width):
     filled = int((percent / 100) * width)
@@ -167,7 +249,7 @@ def get_priority_order(priority):
 def draw_dashboard(stdscr, con, cursor_idx, where_clause="", params=(), subtitle=""):
     stdscr.clear()
     stdscr.addstr(0, 0, "📋 Daily Planner (Dashboard)")
-    stdscr.addstr(1, 0, "a=add  d=done  x=delete  c=completed  g=grind  w=weekly  /=search  f=filter  q=quit")
+    stdscr.addstr(1, 0, "a=add  d=done  x=delete  c=completed  g=grind  w=weekly  m=monthly  q=quit")
     stdscr.addstr(2, 0, "-" * 70)
 
     if subtitle:
@@ -396,6 +478,95 @@ def draw_weekly_stats(stdscr, con):
     stdscr.refresh()
 
 
+def draw_monthly_overview(stdscr, con):
+    stdscr.clear()
+    stdscr.addstr(0, 0, "📈 MONTHLY & QUARTERLY OVERVIEW", curses.A_BOLD)
+    stdscr.addstr(1, 0, "Press 'b' to go back")
+    stdscr.addstr(2, 0, "=" * 70)
+    
+    today = date.today()
+    month_name = today.strftime("%B %Y")
+    
+    # MONTHLY STATS
+    stdscr.addstr(4, 0, f"📅 MONTHLY REPORT - {month_name}", curses.color_pair(4) | curses.A_BOLD)
+    stdscr.addstr(5, 0, "-" * 70)
+    
+    monthly = get_monthly_stats(con)
+    daily_goal = get_daily_goal(con)
+    monthly_goal = daily_goal * monthly['days_in_month']
+    monthly_avg = monthly['total'] / monthly['days_in_month'] if monthly['days_in_month'] > 0 else 0
+    monthly_progress = int((monthly['total'] / monthly_goal) * 100) if monthly_goal > 0 else 0
+    
+    stdscr.addstr(7, 0, f"  Total Completed: {monthly['total']} tasks")
+    stdscr.addstr(8, 0, f"  Days Active: {len(monthly['daily_counts'])} / {monthly['days_in_month']} days")
+    stdscr.addstr(9, 0, f"  Daily Average: {monthly_avg:.1f} tasks")
+    stdscr.addstr(10, 0, f"  Monthly Goal: {monthly_goal} tasks")
+    stdscr.addstr(11, 0, f"  Progress: {monthly_progress}%")
+    
+    if monthly_progress >= 100:
+        stdscr.addstr(12, 0, "  🏆 Goal achieved! Excellent month!", curses.color_pair(3) | curses.A_BOLD)
+    elif monthly_progress >= 75:
+        stdscr.addstr(12, 0, "  💪 Strong performance this month!", curses.color_pair(3))
+    elif monthly_progress >= 50:
+        stdscr.addstr(12, 0, "  📊 Making good progress!", curses.color_pair(2))
+    else:
+        stdscr.addstr(12, 0, "  📈 Room for improvement!", curses.color_pair(2))
+    
+    # Priority breakdown
+    if monthly['priority_counts']:
+        stdscr.addstr(14, 0, "Priority Breakdown:", curses.A_BOLD)
+        y = 15
+        for priority in ['High', 'Medium', 'Low']:
+            count = monthly['priority_counts'].get(priority, 0)
+            percent = int((count / monthly['total']) * 100) if monthly['total'] > 0 else 0
+            symbol = "🔴" if priority == "High" else ("🟡" if priority == "Medium" else "🟢")
+            stdscr.addstr(y, 0, f"  {symbol} {priority}: {count} tasks ({percent}%)")
+            y += 1
+    
+    # Top categories
+    if monthly['category_counts']:
+        stdscr.addstr(19, 0, "Top Categories:", curses.A_BOLD)
+        sorted_cats = sorted(monthly['category_counts'].items(), key=lambda x: x[1], reverse=True)[:5]
+        for idx, (cat, count) in enumerate(sorted_cats):
+            percent = int((count / monthly['total']) * 100) if monthly['total'] > 0 else 0
+            stdscr.addstr(20 + idx, 0, f"  #{cat}: {count} tasks ({percent}%)", curses.color_pair(4))
+    
+    # QUARTERLY STATS
+    stdscr.addstr(26, 0, "=" * 70)
+    quarterly = get_quarterly_stats(con)
+    stdscr.addstr(27, 0, f"📊 QUARTERLY REPORT - Q{quarterly['quarter']} {today.year}", curses.color_pair(4) | curses.A_BOLD)
+    stdscr.addstr(28, 0, "-" * 70)
+    
+    quarterly_goal = daily_goal * quarterly['days_in_quarter']
+    quarterly_avg = quarterly['total'] / quarterly['days_in_quarter'] if quarterly['days_in_quarter'] > 0 else 0
+    quarterly_progress = int((quarterly['total'] / quarterly_goal) * 100) if quarterly_goal > 0 else 0
+    
+    stdscr.addstr(30, 0, f"  Total Completed: {quarterly['total']} tasks")
+    stdscr.addstr(31, 0, f"  Daily Average: {quarterly_avg:.1f} tasks")
+    stdscr.addstr(32, 0, f"  Quarterly Goal: {quarterly_goal} tasks")
+    stdscr.addstr(33, 0, f"  Progress: {quarterly_progress}%")
+    
+    # Monthly breakdown for quarter
+    stdscr.addstr(35, 0, "Monthly Breakdown:", curses.A_BOLD)
+    max_monthly = max((count for _, count in quarterly['monthly_totals']), default=1)
+    for idx, (month, count) in enumerate(quarterly['monthly_totals']):
+        stdscr.addstr(36 + idx, 0, f"  {month}: {count:3d} tasks ")
+        draw_bar_chart(stdscr, 36 + idx, 25, count, max_monthly, 30)
+    
+    # Trend indicator
+    if len(quarterly['monthly_totals']) >= 2:
+        last_month = quarterly['monthly_totals'][-1][1]
+        prev_month = quarterly['monthly_totals'][-2][1]
+        if last_month > prev_month:
+            stdscr.addstr(40, 0, "  📈 Trending UP - You're improving!", curses.color_pair(3))
+        elif last_month < prev_month:
+            stdscr.addstr(40, 0, "  📉 Trending DOWN - Time to refocus!", curses.color_pair(2))
+        else:
+            stdscr.addstr(40, 0, "  ➡️  Steady performance", curses.color_pair(4))
+    
+    stdscr.refresh()
+
+
 # ---------- Main Loop ----------
 def main(stdscr):
     con = init_db()
@@ -424,6 +595,8 @@ def main(stdscr):
             draw_daily_grind(stdscr, con)
         elif view == "weekly":
             draw_weekly_stats(stdscr, con)
+        elif view == "monthly":
+            draw_monthly_overview(stdscr, con)
 
         ch = stdscr.getch()
 
@@ -463,6 +636,8 @@ def main(stdscr):
                 view = "grind"
             elif ch == ord("w"):
                 view = "weekly"
+            elif ch == ord("m"):
+                view = "monthly"
             elif ch == ord("f"):  # filter by category
                 curses.echo()
                 stdscr.addstr(21, 0, "Filter by category (#tag): ")
@@ -502,6 +677,9 @@ def main(stdscr):
                     pass
                 curses.noecho()
         elif view == "weekly":
+            if ch == ord("b"):
+                view = "dashboard"
+        elif view == "monthly":
             if ch == ord("b"):
                 view = "dashboard"
 
